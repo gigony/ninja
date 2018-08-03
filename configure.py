@@ -498,6 +498,7 @@ for name in ['build',
              'metrics',
              'state',
              'string_piece_util',
+             'trie',
              'util',
              'version']:
     objs += cxx(name)

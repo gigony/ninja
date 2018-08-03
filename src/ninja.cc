@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sstream>
 
 #ifdef _WIN32
 #include "getopt.h"
@@ -44,6 +45,7 @@
 #include "state.h"
 #include "util.h"
 #include "version.h"
+#include "trie.h"
 
 #ifdef _MSC_VER
 // Defined in msvc_helper_main-win32.cc.
@@ -56,6 +58,39 @@ void CreateWin32MiniDump(_EXCEPTION_POINTERS* pep);
 namespace {
 
 struct Tool;
+
+// Trim left
+inline string& TrimLeft(string& s, const char* t = " ")
+{
+  s.erase(0, s.find_first_not_of(t));
+  return s;
+}
+
+// Trim right
+inline string& TrimRight(string& s, const char* t = " ")
+{
+  s.erase(s.find_last_not_of(t) + 1);
+  return s;
+}
+
+// Trim both ends
+inline string& TrimStr(string& s, const char* t = " ")
+{
+  return TrimLeft(TrimRight(s, t), t);
+}
+
+/// Split string
+template <class Container>
+void SplitStr(const std::string& str, Container& cont, const char* delim = " ")
+{
+  std::stringstream ss(str);
+  std::string token;
+  while (std::getline(ss, token, *delim)) {
+    TrimStr(token, delim);
+    cont.push_back(token);
+  }
+}
+
 
 /// Command-line options.
 struct Options {
@@ -690,6 +725,80 @@ string EvaluateCommandWithRspfile(Edge* edge, EvaluateCommandMode mode) {
   return command;
 }
 
+string& FilterCommand4AOSP(string& cmd, const string& inp, string workspace,
+                      vector<string>& strs_to_remove, string& compiler_pattern) {
+  static const string cat_pattern = "\\$(cat";
+  static char buf[2048];
+
+  // Trim postfix string after @a inp which is an input source file name.
+  int pos = cmd.rfind(inp);
+  if (pos != -1) {
+    cmd = cmd.substr(0, pos + inp.size());
+  }
+
+  // Remove unnecessary strings from commmand
+  for (vector<string>::iterator it = strs_to_remove.begin();
+       it != strs_to_remove.end();
+       ++it) {
+    string& remove= (*it);
+    if (remove.length() > 0) {
+      string::size_type i = cmd.find(remove);
+      while (i != std::string::npos) {
+        cmd.erase(i, remove.length());
+        i = cmd.find(remove, i);
+      }
+    }
+  }
+
+  // Trim prefix string before @a compiler_pattern
+  pos = cmd.find(compiler_pattern);
+  if (pos != -1) {
+    if (workspace[workspace.length() - 1] != '/') {
+      workspace += '/';
+    }
+    cmd = workspace + cmd.substr(pos);
+  }
+
+  // Process '\\$(cat ...)' pattern
+  string result;
+  int prev_pos = -1;
+  pos = cmd.find(cat_pattern);
+  while (pos != -1) {
+    int r_pos = cmd.find(")", pos);
+    if (r_pos != -1) {
+
+      string include = cmd.substr(pos + cat_pattern.length(),
+                                  r_pos - pos - cat_pattern.length());
+      string include_content;
+
+      FILE* fp;
+      if ((fp = fopen((workspace + include).c_str(), "r")) == NULL)
+      {
+        fprintf(stderr, "[Warning] %s is not available\n", include.c_str());
+      } else {
+        while (fgets(buf, sizeof(buf), fp) != NULL)
+        {
+          buf[strlen(buf) - 1] = '\0';
+          include_content = (include_content + buf) + " ";
+        }
+        fclose(fp);
+      }
+      result += cmd.substr(prev_pos + 1, pos - prev_pos - 1) + include_content;
+      prev_pos = r_pos;
+      pos = cmd.find(cat_pattern, prev_pos + 1);
+    } else {
+
+      fprintf(stderr, "[Warning] No matching ')' for '\\$(cat' at pos %d\n",
+              pos);
+      pos = cmd.find(cat_pattern, pos + 1);
+    }
+  }
+  result += cmd.substr(prev_pos + 1, cmd.length() - (prev_pos + 1));
+  cmd = result;
+
+  return cmd;
+}
+
 int NinjaMain::ToolCompilationDatabase(const Options* options, int argc,
                                        char* argv[]) {
   // The compdb tool uses getopt, and expects argv[0] to contain the name of
@@ -699,12 +808,94 @@ int NinjaMain::ToolCompilationDatabase(const Options* options, int argc,
 
   EvaluateCommandMode eval_mode = ECM_NORMAL;
 
+  bool use_extension = false;
+  string workspace_path;
+  string compiler_pattern = "prebuilts/";
+  vector<string> strs_to_remove;
+  vector<string> prefix_paths;
+  string init_input[] = {".c", ".cc", ".cpp"};
+  set<string> input_exts(init_input,
+                         init_input + sizeof(init_input)/sizeof(init_input[0]));
+  string init_output[] = {".o"};
+  set<string> output_exts(init_output,
+                          init_output +
+                            sizeof(init_output)/sizeof(init_output[0]));;
+
   optind = 1;
   int opt;
-  while ((opt = getopt(argc, argv, const_cast<char*>("hx"))) != -1) {
+  while ((opt = getopt(argc, argv, const_cast<char*>("hxw:c:r:p:i:o:m:")))
+         != -1) {
     switch(opt) {
       case 'x':
         eval_mode = ECM_EXPAND_RSPFILE;
+        break;
+
+      case 'w':
+        workspace_path = optarg;
+        use_extension = true;
+        break;
+
+      case 'c':
+        compiler_pattern = optarg;
+        use_extension = true;
+        break;
+
+      case 'r':
+        {
+          string arg = optarg;
+          vector<string> items;
+          SplitStr(arg, items, ",");
+          std::copy(items.begin(),
+                    items.end(),
+                    inserter(strs_to_remove, strs_to_remove.end()));
+          for (vector<string>::iterator it = strs_to_remove.begin();
+               it != strs_to_remove.end();
+               ++it) {
+            string &remove = (*it);
+            if (remove[remove.length() - 1] != '/') {
+              remove.append("/");
+            }
+          }
+          use_extension = true;
+        }
+        break;
+
+      case 'p':
+        {
+          string arg = optarg;
+          vector<string> items;
+          SplitStr(arg, items, ",");
+          std::copy(items.begin(),
+                    items.end(),
+                    inserter(prefix_paths, prefix_paths.end()));
+          use_extension = true;
+        }
+        break;
+
+      case 'i':
+        {
+          string arg = optarg;
+          vector<string> items;
+          SplitStr(arg, items, ",");
+          input_exts.clear();
+          std::copy(items.begin(),
+                    items.end(),
+                    inserter(input_exts, input_exts.end()));
+          use_extension = true;
+        }
+        break;
+
+      case 'o':
+        {
+          string arg = optarg;
+          vector<string> items;
+          SplitStr(arg, items, ",");
+          output_exts.clear();
+          std::copy(items.begin(),
+                    items.end(),
+                    inserter(output_exts, output_exts.end()));
+          use_extension = true;
+        }
         break;
 
       case 'h':
@@ -714,6 +905,17 @@ int NinjaMain::ToolCompilationDatabase(const Options* options, int argc,
             "\n"
             "options:\n"
             "  -x     expand @rspfile style response file invocations\n"
+            "  -w     workspace root path\n"
+            "  -c     pattern to identify the compiler path.\n"
+            "           (default: prebuilts/)\n"
+            "           : prefix string before the pattern will be replaced\n"
+            "             with the workspace root path\n"
+            "  -r     paths to be removed in command. concatenated with ','\n"
+            "  -p     list of prefix paths. concatenated with ','\n"
+            "  -i     list of input extensions. concatenated with ','\n"
+            "           (default: .c,.cc,.cpp)\n"
+            "  -o     list of output extensions. concatenated with ',' \n"
+            "           (default: .o)\n"
             );
         return 1;
     }
@@ -723,38 +925,83 @@ int NinjaMain::ToolCompilationDatabase(const Options* options, int argc,
 
   bool first = true;
   vector<char> cwd;
-
-  do {
-    cwd.resize(cwd.size() + 1024);
-    errno = 0;
-  } while (!getcwd(&cwd[0], cwd.size()) && errno == ERANGE);
-  if (errno != 0 && errno != ERANGE) {
-    Error("cannot determine working directory: %s", strerror(errno));
-    return 1;
+  if (workspace_path.length() == 0) {
+    do {
+      cwd.resize(cwd.size() + 1024);
+      errno = 0;
+    } while (!getcwd(&cwd[0], cwd.size()) && errno == ERANGE);
+    if (errno != 0 && errno != ERANGE) {
+      Error("cannot determine working directory: %s", strerror(errno));
+      return 1;
+    }
+  } else {
+    copy(workspace_path.begin(), workspace_path.end(), back_inserter(cwd));
+    cwd.push_back(0);
   }
+
+  Trie prefix_tree;
+  prefix_tree.BuildTrie(prefix_paths);
 
   putchar('[');
   for (vector<Edge*>::iterator e = state_.edges_.begin();
        e != state_.edges_.end(); ++e) {
     if ((*e)->inputs_.empty())
       continue;
-    for (int i = 0; i != argc; ++i) {
-      if ((*e)->rule_->name() == argv[i]) {
-        if (!first)
-          putchar(',');
+    bool is_match = false;
 
-        printf("\n  {\n    \"directory\": \"");
-        EncodeJSONString(&cwd[0]);
-        printf("\",\n    \"command\": \"");
-        EncodeJSONString(EvaluateCommandWithRspfile(*e, eval_mode).c_str());
-        printf("\",\n    \"file\": \"");
-        EncodeJSONString((*e)->inputs_[0]->path().c_str());
+    for (int i = 0; i != argc && !use_extension; ++i) {
+      if ((*e)->rule_->name() == argv[i]) {
+        is_match = true;
+      }
+    }
+
+    const string &input_path = (*e)->inputs_[0]->path();
+    if (use_extension) {
+      bool has_value = false;
+      int ext_pos = input_path.rfind(".");
+      if (ext_pos != -1 &&
+          input_exts.count(input_path.substr(ext_pos)) != 0) {
+        const string &output_path = (*e)->outputs_[0]->path();
+
+        ext_pos = output_path.rfind(".");
+        if (ext_pos != -1 &&
+            output_exts.count(output_path.substr(ext_pos)) != 0) {
+          has_value = true;
+        }
+      }
+
+      if (has_value && prefix_tree.Contains(input_path)) {
+        is_match = true;
+      }
+    }
+
+    if (is_match) {
+      if (!first)
+        putchar(',');
+
+      printf("\n  {\n    \"directory\": \"");
+      EncodeJSONString(&cwd[0]);
+      printf("\",\n    \"command\": \"");
+      string command_str = EvaluateCommandWithRspfile(*e, eval_mode);
+      if (use_extension) {
+        command_str = FilterCommand4AOSP(command_str,
+                                         input_path,
+                                         &cwd[0],
+                                         strs_to_remove,
+                                         compiler_pattern);
+      }
+      EncodeJSONString(command_str.c_str());
+      printf("\",\n    \"file\": \"");
+      EncodeJSONString(input_path.c_str());
+      if (!use_extension) {
         printf("\",\n    \"output\": \"");
         EncodeJSONString((*e)->outputs_[0]->path().c_str());
         printf("\"\n  }");
-
-        first = false;
+      } else {
+        printf("\n  }");
       }
+
+      first = false;
     }
   }
 
